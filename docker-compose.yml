@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  spam-check-bot:
+    build: .
+    container_name: telegram-spam-check-bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    ports:
+      - "8000:8000"
