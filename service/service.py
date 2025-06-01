@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import zipfile
 import traceback
@@ -9,7 +10,7 @@ import time
 from typing import Dict, List, Tuple
 
 from telethon import TelegramClient, types
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, PhoneCodeInvalidError
 
 PROXY_LIST = [
     "pool.infatica.io:10000:DpzAsXEwWPAxKnBCo9lu:RNW78Fm5",
@@ -170,6 +171,10 @@ class Service:
             proxy: tuple,
             account_logger: logging.Logger
     ) -> str:
+        old_client = None
+        new_client = None
+        new_session_path = None
+
         try:
             account_logger.info("Loading account credentials")
 
@@ -191,8 +196,9 @@ class Service:
                     return "error"
 
                 phone = data.get("phone", "")
+                twofa_password = data.get("twoFA")
 
-            proxy_type, host, port, username, password = proxy
+            proxy_type, host, port, username, proxy_password = proxy
 
             proxy_config = (
                 proxy_type,
@@ -200,12 +206,12 @@ class Service:
                 port,
                 True,
                 username,
-                password
+                proxy_password
             )
 
             account_logger.info(f"Using proxy: {username}@{host}:{port}")
 
-            client = TelegramClient(
+            old_client = TelegramClient(
                 session_path,
                 api_id,
                 api_hash,
@@ -216,41 +222,152 @@ class Service:
                 system_lang_code="en"
             )
 
-            account_logger.info("Connecting to Telegram...")
-            await client.connect()
+            account_logger.info("Connecting to existing session...")
+            await old_client.connect()
             account_logger.info("Connected to Telegram")
 
-            account_logger.info("Checking authorization status")
-            authorized = await client.is_user_authorized()
-            account_logger.info(f"Authorization status: {authorized}")
-
+            authorized = await old_client.is_user_authorized()
             if not authorized:
-                account_logger.warning("Account not authorized")
+                account_logger.warning("Account not authorized in existing session")
                 return "error"
 
-            account_logger.info("Checking spam status with @SpamBot")
-            is_banned = await self._check_spam_status(client, account_logger)
+            new_session_path = f"{session_path}_new"
+            account_logger.info(f"Creating new session at: {new_session_path}")
+
+            new_client = TelegramClient(
+                new_session_path,
+                api_id,
+                api_hash,
+                proxy=proxy_config,
+                device_model="CheckBot_NewSession",
+                system_version="Linux",
+                app_version="1.0",
+                system_lang_code="en"
+            )
+
+            await new_client.connect()
+            account_logger.info("New session client connected")
+
+            account_logger.info("Requesting login code for new session")
+            try:
+                sent = await new_client.send_code_request(phone)
+                phone_code_hash = sent.phone_code_hash
+                account_logger.info("Login code requested")
+            except FloodWaitError as fwe:
+                account_logger.error(f"Flood wait error: {fwe}")
+                return "error"
+
+            account_logger.info("Waiting for verification code in existing session...")
+            code = await self._wait_for_verification_code(old_client, account_logger)
+            if not code:
+                account_logger.error("Verification code not received")
+                return "error"
+
+            account_logger.info(f"Attempting sign-in with code: {code}")
+            try:
+                await new_client.sign_in(
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=phone_code_hash
+                )
+                account_logger.info("Successfully signed in to new session")
+            except SessionPasswordNeededError:
+                account_logger.info("2FA password required")
+                if not twofa_password:
+                    account_logger.error("2FA password not provided in JSON")
+                    return "error"
+                try:
+                    await new_client.sign_in(password=twofa_password)
+                    account_logger.info("Successfully signed in with 2FA")
+                except Exception as e:
+                    account_logger.error(f"2FA sign-in failed: {str(e)}")
+                    return "error"
+            except PhoneCodeInvalidError:
+                account_logger.error("Invalid verification code")
+                return "error"
+            except Exception as e:
+                account_logger.error(f"Sign-in failed: {str(e)}")
+                return "error"
+
+            account_logger.info("Checking spam status with new session")
+            is_banned = await self._check_spam_status(new_client, account_logger)
 
             return "banned" if is_banned else "ok"
 
         except FloodWaitError as flood_wait_error:
             account_logger.error(f"FloodWait error: {flood_wait_error}")
             return "error"
-        except SessionPasswordNeededError:
-            account_logger.error("Two-factor authentication password needed")
-            return "error"
         except Exception as exception:
-            account_logger.error(f"Error during account check: {str(exception)}")
+            account_logger.error(f"Error during account processing: {str(exception)}")
             account_logger.error(traceback.format_exc())
             return "error"
         finally:
-            if 'client' in locals():
-                account_logger.info("Disconnecting client")
-                try:
-                    await client.disconnect()
-                    account_logger.info("Client disconnected")
-                except Exception as disconnect_exception:
-                    account_logger.error(f"Error disconnecting client: {str(disconnect_exception)}")
+            if new_client and new_client.is_connected():
+                account_logger.info("Disconnecting new session client")
+                await new_client.disconnect()
+            if old_client and old_client.is_connected():
+                account_logger.info("Disconnecting existing session client")
+                await old_client.disconnect()
+
+    async def _wait_for_verification_code(
+            self,
+            client: TelegramClient,
+            account_logger: logging.Logger,
+            timeout: int = 30
+    ) -> str:
+        start_time = time.time()
+
+        code_pattern = re.compile(r'\b(\d{5,6})\b')
+        code_phrases = [
+            "код", "code", "код подтверждения", "verification code",
+            "confirmation code", "подтверждения", "проверки"
+        ]
+        senders = [777000, "SpamBot", "telegram"]
+
+        while time.time() - start_time < timeout:
+            waited = time.time() - start_time
+            account_logger.info(f"Ожидание кода... Прошло {waited:.0f} сек")
+
+            try:
+                for sender in senders:
+                    try:
+                        messages = await client.get_messages(sender, limit=5)
+                        account_logger.debug(f"Проверено сообщений от {sender}: {len(messages)}")
+
+                        for msg in messages:
+                            if msg.date.timestamp() < start_time:
+                                continue
+
+                            if msg.text:
+                                account_logger.debug(f"Сообщение от {sender}: {msg.text[:50]}...")
+
+                                match = code_pattern.search(msg.text)
+                                if match:
+                                    code = match.group(1)
+                                    account_logger.info(f"Найден код подтверждения: {code}")
+                                    return code
+
+                                text_lower = msg.text.lower()
+                                if any(phrase in text_lower for phrase in code_phrases):
+                                    account_logger.info("Обнаружено сообщение с упоминанием кода")
+
+                                    numbers = re.findall(r'\d{5,6}', msg.text)
+                                    if numbers:
+                                        code = numbers[0]
+                                        account_logger.info(f"Извлечен код: {code}")
+                                        return code
+                                    else:
+                                        account_logger.warning("Ключевые фразы найдены, но код не обнаружен")
+                    except Exception as e:
+                        account_logger.warning(f"Ошибка при проверке сообщений от {sender}: {str(e)}")
+
+            except Exception as e:
+                account_logger.warning(f"Общая ошибка при проверке сообщений: {str(e)}")
+
+            await asyncio.sleep(10)
+
+        account_logger.warning("Код подтверждения не получен в течение таймаута")
+        return ""
 
     async def _check_spam_status(self, client: TelegramClient, account_logger: logging.Logger) -> bool:
         try:
